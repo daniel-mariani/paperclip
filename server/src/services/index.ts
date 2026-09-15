@@ -125,7 +125,7 @@ export type {
 } from "./authorization.js";
 export { boardAuthService } from "./board-auth.js";
 export { instanceSettingsService, applyManagedExperimentalOverlay } from "./instance-settings.js";
-export { subscriptionThrottleService } from "./subscription-throttle.js";
+export { subscriptionThrottleService, monthlySpendThrottleService } from "./subscription-throttle.js";
 export { subscriptionWindowUsage } from "./costs.js";
 export {
   getManagedInstanceConfig,

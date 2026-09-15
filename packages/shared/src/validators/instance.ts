@@ -36,6 +36,18 @@ export const subscriptionThrottleConfigSchema = z.object({
   cachedWeight: z.number().min(0).max(1).default(0),
 });
 
+export const monthlySpendThrottleConfigSchema = z.object({
+  enabled: z.boolean().default(false),
+  provider: z.string().min(1).default("anthropic"),
+  monthlyBudgetCents: z.number().int().positive(),
+  pausePercent: z.number().min(1).max(99).default(80),
+  resumePercent: z.number().min(1).max(99).default(50),
+}).refine(
+  (data) => data.resumePercent < data.pausePercent,
+  { message: "resumePercent must be strictly less than pausePercent to prevent hysteresis flapping", path: ["resumePercent"] },
+);
+export type MonthlySpendThrottleConfig = z.infer<typeof monthlySpendThrottleConfigSchema>;
+
 export const instanceGeneralSettingsSchema = z.object({
   censorUsernameInLogs: z.boolean().default(false),
   keyboardShortcuts: z.boolean().default(false),
@@ -49,8 +61,12 @@ export const instanceGeneralSettingsSchema = z.object({
   // Subscription window throttle — gates claude_local dispatch before the
   // shared 5h Anthropic window fills to 100% and kills in-flight runs.
   subscriptionThrottle: subscriptionThrottleConfigSchema.optional(),
+  // Monthly USD spend throttle — gates claude_local dispatch when Anthropic
+  // monthly spend approaches the configured budget ceiling.
+  monthlySpendThrottle: monthlySpendThrottleConfigSchema.optional(),
 }).strict();
 
+// Patch schema for general settings — supports subscriptionThrottle and monthlySpendThrottle.
 export const patchInstanceGeneralSettingsSchema = z
   .object(shapeWithoutDefaults(instanceGeneralSettingsSchema.shape))
   .partial()

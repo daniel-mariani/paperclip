@@ -1641,6 +1641,8 @@ export {
 export {
   subscriptionThrottleConfigSchema,
   type SubscriptionThrottleConfig,
+  monthlySpendThrottleConfigSchema,
+  type MonthlySpendThrottleConfig,
   instanceSettingsSchema,
   instanceGeneralSettingsSchema,
   patchInstanceGeneralSettingsSchema,
