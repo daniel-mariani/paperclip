@@ -217,7 +217,7 @@ import {
   instanceSettingsService,
   resolveWorktreeRunExecutionActivation,
 } from "./instance-settings.js";
-import { subscriptionThrottleService } from "./subscription-throttle.js";
+import { subscriptionThrottleService, monthlySpendThrottleService } from "./subscription-throttle.js";
 import {
   evaluateExecutionAllowlist,
   isExecutionForcedToKubernetes,
@@ -6852,6 +6852,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   };
   const budgets = budgetService(db, budgetHooks);
   const subscriptionThrottle = subscriptionThrottleService(db, instanceSettings);
+  const monthlySpendThrottle = monthlySpendThrottleService(db, instanceSettings);
   const recovery = recoveryService(db, { enqueueWakeup });
 
   function isPlanApprovalConfirmationPayload(payload: unknown) {
@@ -12682,6 +12683,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return null;
     }
 
+    const monthlyBlock = await monthlySpendThrottle.getBlock(run.companyId);
+    if (monthlyBlock) {
+      logger.warn(
+        { runId: run.id, companyId: run.companyId, usagePercent: monthlyBlock.usagePercent },
+        "claimQueuedRun: deferring queued run due to monthly spend throttle; run stays queued",
+      );
+      return null;
+    }
+
     const dailyCapBlock = await getHeartbeatDailyCapBlock(agent, parseHeartbeatPolicy(agent), {
       excludeRunId: run.id,
       checkRunCap: true,
@@ -18112,6 +18122,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
       if (opts.requestedByActorType === "user") {
         throw conflict(throttleBlock.reason, { code: "subscription_throttle" });
+      }
+      return null;
+    }
+
+    const monthlyBlock = await monthlySpendThrottle.getBlock(agent.companyId);
+    if (monthlyBlock) {
+      await writeSkippedHeartbeatRequest("monthly_spend_throttle", {
+        provider: monthlyBlock.provider,
+        usagePercent: monthlyBlock.usagePercent,
+      });
+      if (opts.requestedByActorType === "user") {
+        throw conflict(monthlyBlock.reason, { code: "monthly_spend_throttle" });
       }
       return null;
     }

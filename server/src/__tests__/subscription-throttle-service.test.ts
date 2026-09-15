@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { subscriptionThrottleService } from "../services/subscription-throttle.js";
+import { subscriptionThrottleService, monthlySpendThrottleService } from "../services/subscription-throttle.js";
 import { subscriptionWindowUsage } from "../services/costs.js";
 
 // ---------------------------------------------------------------------------
@@ -331,5 +331,123 @@ describe("subscriptionThrottleService.getStatus", () => {
     expect(status.estimatedCeilingTokens).toBe(1_500_000);
     expect(status.pausePercent).toBe(80);
     expect(status.resumePercent).toBe(50);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// monthlySpendThrottleService — USD spend hysteresis state machine
+// ---------------------------------------------------------------------------
+
+const monthlyBudgetConfig = {
+  enabled: true,
+  provider: "anthropic",
+  monthlyBudgetCents: 10_000,
+  pausePercent: 80,
+  resumePercent: 50,
+};
+
+function makeInstanceSvcMonthly(config: Record<string, unknown> | null) {
+  return {
+    getGeneral: vi.fn().mockResolvedValue({
+      monthlySpendThrottle: config,
+    }),
+  } as any;
+}
+
+function makeDbWithSpend(spendCents: number, stateRow: Record<string, unknown> | null = null) {
+  const spendRow = [{ total: spendCents }];
+  const stateRows = stateRow ? [stateRow] : [];
+  return {
+    select: vi.fn().mockReturnValue({
+      from: vi.fn().mockReturnThis(),
+      where: vi.fn()
+        .mockResolvedValueOnce(spendRow)    // getMonthlySpendCents
+        .mockResolvedValueOnce(stateRows),  // readState
+    }),
+    insert: mockInsert,
+  } as any;
+}
+
+describe("monthlySpendThrottleService", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockInsertValues.mockReturnValue(mockInsertChain);
+  });
+
+  it("returns null when config is absent", async () => {
+    const svc = monthlySpendThrottleService(makeDb(), makeInstanceSvcMonthly(null));
+    expect(await svc.getBlock("company-1")).toBeNull();
+  });
+
+  it("returns null when config is disabled", async () => {
+    const svc = monthlySpendThrottleService(
+      makeDb(),
+      makeInstanceSvcMonthly({ ...monthlyBudgetConfig, enabled: false }),
+    );
+    expect(await svc.getBlock("company-1")).toBeNull();
+  });
+
+  it("returns null when spend is below pausePercent with no prior state", async () => {
+    // 70% of $100 budget = $70 spend = 7000 cents
+    const svc = monthlySpendThrottleService(
+      makeDbWithSpend(7_000),
+      makeInstanceSvcMonthly(monthlyBudgetConfig),
+    );
+    expect(await svc.getBlock("company-1")).toBeNull();
+  });
+
+  it("activates (returns block) when spend reaches pausePercent", async () => {
+    // 85% of $100 budget = $85 spend = 8500 cents
+    const svc = monthlySpendThrottleService(
+      makeDbWithSpend(8_500),
+      makeInstanceSvcMonthly(monthlyBudgetConfig),
+    );
+    const block = await svc.getBlock("company-1");
+
+    expect(block).not.toBeNull();
+    expect(block!.active).toBe(true);
+    expect(block!.provider).toBe("anthropic");
+    expect(block!.usagePercent).toBeCloseTo(85, 1);
+    expect(block!.reason).toContain("$85.00");
+    expect(block!.reason).toContain("$100.00");
+    expect(block!.reason).toContain("85.0%");
+  });
+
+  it("stays active (hysteresis) when spend is between resumePercent and pausePercent", async () => {
+    // 65% spend — between resume (50%) and pause (80%)
+    const stateRow = { throttleActive: true, usagePercent: "85.0000", since: new Date(), updatedAt: new Date() };
+    const svc = monthlySpendThrottleService(
+      makeDbWithSpend(6_500, stateRow),
+      makeInstanceSvcMonthly(monthlyBudgetConfig),
+    );
+    const block = await svc.getBlock("company-1");
+
+    expect(block).not.toBeNull();
+    expect(block!.usagePercent).toBeCloseTo(65, 1);
+  });
+
+  it("deactivates when spend drops below resumePercent", async () => {
+    // 45% spend — below resume (50%)
+    const stateRow = { throttleActive: true, usagePercent: "65.0000", since: new Date(), updatedAt: new Date() };
+    const svc = monthlySpendThrottleService(
+      makeDbWithSpend(4_500, stateRow),
+      makeInstanceSvcMonthly(monthlyBudgetConfig),
+    );
+    expect(await svc.getBlock("company-1")).toBeNull();
+    expect(mockInsert).toHaveBeenCalled();
+    expect(mockInsertValues).toHaveBeenCalledWith(
+      expect.objectContaining({ throttleActive: false }),
+    );
+  });
+
+  it("reason string includes budget and spend amounts", async () => {
+    const svc = monthlySpendThrottleService(
+      makeDbWithSpend(8_500),
+      makeInstanceSvcMonthly(monthlyBudgetConfig),
+    );
+    const block = await svc.getBlock("company-1");
+
+    expect(block!.reason).toContain("$85.00 of $100.00 monthly budget");
+    expect(block!.reason).toContain("Dispatch will resume once spend drops below 50%");
   });
 });
