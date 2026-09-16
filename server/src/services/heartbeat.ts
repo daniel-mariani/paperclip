@@ -50,6 +50,7 @@ import {
 import { agentService } from "./agents.js";
 import { normalizeLegacyRunnerProvider } from "@paperclipai/adapter-utils";
 import fs from "node:fs/promises";
+import { readFileSync as readFileSyncFs } from "node:fs";
 import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
@@ -8806,6 +8807,43 @@ export async function persistHeartbeatRunProcessMetadata(
     });
     return run;
   });
+}
+
+// Returns the wall-clock process start time in milliseconds by reading
+// /proc/<pid>/stat (Linux only). Returns null on non-Linux or read failure.
+function readPidStartTimeMs(pid: number): number | null {
+  if (process.platform !== "linux") return null;
+  try {
+    const stat = readFileSyncFs(`/proc/${pid}/stat`, "utf8");
+    // The second field is the process name wrapped in parens. Find the last
+    // closing paren to correctly handle names that contain spaces or parens.
+    const afterParen = stat.lastIndexOf(")");
+    if (afterParen < 0) return null;
+    // Remaining fields after "state" (index 0) — starttime is at index 19.
+    const fields = stat.slice(afterParen + 1).trim().split(/\s+/);
+    const startTicks = parseInt(fields[19] ?? "0", 10);
+    if (!Number.isFinite(startTicks) || startTicks <= 0) return null;
+    const uptimeLine = readFileSyncFs("/proc/uptime", "utf8");
+    const uptimeSec = parseFloat(uptimeLine.split(" ")[0] ?? "0");
+    const bootTimeMs = Date.now() - uptimeSec * 1000;
+    return bootTimeMs + (startTicks / 100) * 1000;
+  } catch {
+    return null;
+  }
+}
+
+// Guards against killing a recycled PID. Returns true when we are confident
+// the PID belongs to the original child, or when we cannot verify (fail open).
+// expectedStartedAt is when Paperclip recorded the run as started, which is
+// close to but not identical to OS process creation time; allow 30 s slack.
+function isProbablySameProcess(
+  pid: number | null | undefined,
+  expectedStartedAt: Date | null | undefined,
+): boolean {
+  if (typeof pid !== "number" || !expectedStartedAt) return true;
+  const procStartMs = readPidStartTimeMs(pid);
+  if (procStartMs === null) return true;
+  return Math.abs(procStartMs - expectedStartedAt.getTime()) < 30_000;
 }
 
 async function terminateHeartbeatRunProcess(input: {
@@ -18996,10 +19034,19 @@ export function heartbeatService(
             continue;
           }
           // Stale detached process — kill it and fall through to terminalize.
-          await terminateHeartbeatRunProcess({
-            pid: run.processPid,
-            processGroupId: run.processGroupId,
-          });
+          // Guard against PID recycling: only send signals if the OS process
+          // start time matches what we recorded when the run was launched.
+          if (isProbablySameProcess(run.processPid, run.processStartedAt)) {
+            await terminateHeartbeatRunProcess({
+              pid: run.processPid,
+              processGroupId: run.processGroupId,
+            });
+          } else {
+            logger.warn(
+              { runId: run.id, pid: run.processPid },
+              "reapOrphanedRuns: detached PID appears reused; skipping kill, proceeding with terminalization",
+            );
+          }
         } else {
           continue;
         }
@@ -19193,7 +19240,24 @@ export function heartbeatService(
       const run = await getRun(runId);
 
       if (!run) {
-        // Stale in-memory entry with no DB row — clean up.
+        // Stale in-memory entry with no DB row (deleted by company/agent cleanup
+        // while the child was still alive). Terminate the process before dropping
+        // the only management handle, otherwise it becomes permanently untracked.
+        const childPid = handle.child.pid;
+        if (typeof childPid === "number" && isProcessAlive(childPid)) {
+          logger.warn(
+            { runId, childPid },
+            "reapSilentZombieRuns: DB row deleted while child still alive; terminating orphaned process",
+          );
+          try {
+            await terminateHeartbeatRunProcess({ pid: childPid, processGroupId: handle.processGroupId });
+          } catch (killErr) {
+            logger.warn(
+              { runId, childPid, err: killErr },
+              "reapSilentZombieRuns: failed to terminate orphaned child after DB row deletion",
+            );
+          }
+        }
         runningProcesses.delete(runId);
         continue;
       }
@@ -19234,13 +19298,25 @@ export function heartbeatService(
         killMessage,
       );
 
-      await terminateHeartbeatRunProcess({
-        pid: run.processPid,
-        processGroupId: run.processGroupId,
-      });
+      // Persist terminal status BEFORE removing the handle so that if this
+      // process crashes between kill and releaseIssueExecutionAndPromote the
+      // lock is still clearable by sweepStaleIssueLocks on the next tick.
+      // Wrap the kill in try-catch: a failed kill should not abort the DB
+      // cleanup or prevent subsequent zombies from being processed in this sweep.
+      try {
+        await terminateHeartbeatRunProcess({
+          pid: run.processPid,
+          processGroupId: run.processGroupId,
+        });
+      } catch (killErr) {
+        logger.warn(
+          { runId, processPid: run.processPid, processGroupId: run.processGroupId, err: killErr },
+          "reapSilentZombieRuns: kill failed; proceeding with DB cleanup and lock release",
+        );
+      }
       runningProcesses.delete(runId);
 
-      // Persist terminal status first so the issue lock is always clearable even
+      // Persist terminal status so the issue lock is always clearable even
       // if the steps below fail partway through.
       let finalizedRun = await setRunStatus(runId, "interrupted", {
         error: killMessage,
