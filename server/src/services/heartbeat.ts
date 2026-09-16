@@ -19244,7 +19244,14 @@ export function heartbeatService(
         // while the child was still alive). Terminate the process before dropping
         // the only management handle, otherwise it becomes permanently untracked.
         const childPid = handle.child.pid;
-        if (typeof childPid === "number" && isProcessAlive(childPid)) {
+        // exitCode === null means Node.js has not yet received the exit event, so
+        // the process is definitely still the one we spawned — PID cannot be
+        // recycled while the original process is still running. If exitCode is set,
+        // the process has already exited and the PID may have been recycled; skip
+        // the kill to avoid hitting an unrelated process.
+        const childStillRunning =
+          handle.child.exitCode === null && handle.child.signalCode === null;
+        if (typeof childPid === "number" && childStillRunning && isProcessAlive(childPid)) {
           logger.warn(
             { runId, childPid },
             "reapSilentZombieRuns: DB row deleted while child still alive; terminating orphaned process",

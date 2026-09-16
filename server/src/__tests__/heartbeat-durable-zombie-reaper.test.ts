@@ -438,6 +438,33 @@ describeEmbeddedPostgres("durable zombie reaper", () => {
       try { child.kill("SIGKILL"); } catch { /* ignore */ }
     }, 10_000);
 
+    it("does not kill orphaned child when its exitCode is already set (PID recycling guard)", async () => {
+      // Spawn a process and wait for it to exit so exitCode is non-null.
+      // This simulates the window between `exit` and `close` where the PID
+      // may have been recycled by the OS but the handle is still in runningProcesses.
+      const child = spawn(process.execPath, ["-e", "process.exit(0)"], { stdio: "ignore" });
+      await new Promise<void>((resolve) => child.once("exit", () => resolve()));
+      expect(child.exitCode).not.toBeNull();
+
+      const runId = randomUUID();
+      // No DB row — simulates deletion while child was alive, but child has since exited.
+      runningProcesses.set(runId, { child, graceSec: 30, processGroupId: null });
+
+      const localSupervisor = await import("../services/local-service-supervisor.js");
+      const killSpy = vi.spyOn(localSupervisor, "terminateLocalService").mockResolvedValue(undefined);
+
+      const heartbeat = heartbeatService(db);
+      await heartbeat.reapSilentZombieRuns({ killThresholdMs: 0 });
+
+      // Handle must be removed regardless.
+      expect(runningProcesses.has(runId)).toBe(false);
+      // terminateLocalService must NOT have been called — exitCode set means the
+      // process already exited and the PID may have been recycled.
+      expect(killSpy).not.toHaveBeenCalled();
+
+      killSpy.mockRestore();
+    }, 10_000);
+
     it(
       "skips kill and terminates run when PID appears recycled (silent zombie path, Linux only)",
       async () => {
